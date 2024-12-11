@@ -197,6 +197,7 @@ class OutputEditor extends AbstractTextResourceEditor {
 			invisibleCharacters: false,
 			ambiguousCharacters: false,
 		};
+		options.occurrencesHighlight = 'off';   // disable symbol highlighting in output editors
 
 		const outputConfig = this.configurationService.getValue<any>('[Log]');
 		if (outputConfig) {

@@ -61,6 +61,16 @@ declare module 'vscode' {
 		// eslint-disable-next-line local/vscode-dts-provider-naming
 		handleDidPartiallyAcceptCompletionItem?(completionItem: InlineCompletionItem, info: PartialAcceptInfo): void;
 
+		/**
+		 * Provides streaming inline completion items for the given position and document.
+		 * @param document The document inline completions are requested for
+		 * @param position The position inline completions are requested for
+		 * @param context The inline completion context
+		 * @param token A cancellation token
+		 * @returns An async iterable that yields completion items as they become available
+		 */
+		provideInlineCompletionItemsStream?(document: TextDocument, position: Position, context: InlineCompletionContext, token: CancellationToken): AsyncIterable<InlineCompletionItem> | Promise<AsyncIterable<InlineCompletionItem>>;
+
 		provideInlineEditsForRange?(document: TextDocument, range: Range, context: InlineCompletionContext, token: CancellationToken): ProviderResult<InlineCompletionItem[] | InlineCompletionList>;
 	}
 

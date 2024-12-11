@@ -113,6 +113,42 @@ export async function provideInlineCompletions(
 	}
 
 	async function query(provider: InlineCompletionsProvider): Promise<InlineCompletionList | undefined> {
+		// Try streaming implementation first
+		if ('provideInlineCompletionItemsStream' in provider) {
+			const items: InlineCompletionItem[] = [];
+			try {
+				const stream = await (typeof provider.provideInlineCompletionItemsStream === 'function'
+					? provider.provideInlineCompletionItemsStream(model, positionOrRange as Position, context, token)
+					: undefined);
+
+				if (!stream) {
+					return undefined;
+				}
+
+				for await (const item of stream) {
+					if (token.isCancellationRequested) {
+						break;
+					}
+					items.push(item);
+				}
+				if (items.length === 0) {
+					return undefined;
+				}
+				// Convert items to InlineCompletion type with readonly properties
+				const completions = items.map(item => ({
+					...item,
+					additionalTextEdits: item.additionalTextEdits ? [...item.additionalTextEdits] : undefined
+				} as InlineCompletion));
+				const list = new InlineCompletionList({ items: completions }, provider);
+				runWhenCancelled(token, () => list.removeRef());
+				return list;
+			} catch (e) {
+				onUnexpectedExternalError(e);
+				return undefined;
+			}
+		}
+
+		// Fallback to non-streaming implementation
 		let result: InlineCompletions | null | undefined;
 		try {
 			if (positionOrRange instanceof Position) {

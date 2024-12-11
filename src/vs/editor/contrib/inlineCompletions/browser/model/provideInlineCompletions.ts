@@ -116,7 +116,52 @@ export async function provideInlineCompletions(
 		let result: InlineCompletions | null | undefined;
 		try {
 			if (positionOrRange instanceof Position) {
-				result = await provider.provideInlineCompletions(model, positionOrRange, context, token);
+				if ('provideStreamingInlineCompletionItems' in provider) {
+					const streamingResults = await provider.provideStreamingInlineCompletionItems(model, positionOrRange, context, token);
+					if (!streamingResults) {
+						return undefined;
+					}
+
+					const items: InlineCompletion[] = [];
+					const commands: Command[] = [];
+
+					for await (const item of streamingResults) {
+						if (token.isCancellationRequested) {
+							break;
+						}
+
+						if (Array.isArray(item)) {
+							items.push(...item.map(i => ({
+								text: typeof i.insertText === 'string' ? i.insertText : i.insertText.value,
+								range: i.range instanceof Range ? i.range : {
+									inserting: i.range?.inserting || new Range(positionOrRange.lineNumber, positionOrRange.column, positionOrRange.lineNumber, positionOrRange.column),
+									replacing: i.range?.replacing || new Range(positionOrRange.lineNumber, positionOrRange.column, positionOrRange.lineNumber, positionOrRange.column)
+								},
+								command: i.command,
+								sourceInlineCompletions: i,
+								sourceProvider: provider
+							})));
+						} else {
+							items.push(...(item.items || []).map(i => ({
+								text: typeof i.insertText === 'string' ? i.insertText : i.insertText.value,
+								range: i.range instanceof Range ? i.range : {
+									inserting: i.range?.inserting || new Range(positionOrRange.lineNumber, positionOrRange.column, positionOrRange.lineNumber, positionOrRange.column),
+									replacing: i.range?.replacing || new Range(positionOrRange.lineNumber, positionOrRange.column, positionOrRange.lineNumber, positionOrRange.column)
+								},
+								command: i.command,
+								sourceInlineCompletions: i,
+								sourceProvider: provider
+							})));
+							if (item.commands) {
+								commands.push(...item.commands);
+							}
+						}
+					}
+
+					result = { items, commands };
+				} else {
+					result = await provider.provideInlineCompletions(model, positionOrRange, context, token);
+				}
 			} else {
 				result = await provider.provideInlineEditsForRange?.(model, positionOrRange, context, token);
 			}
@@ -136,12 +181,11 @@ export async function provideInlineCompletions(
 
 	if (token.isCancellationRequested) {
 		tokenSource.dispose(true);
-		// result has been disposed before we could call addRef! So we have to discard everything.
 		return new InlineCompletionProviderResult([], new Set(), []);
 	}
 
 	const result = await addRefAndCreateResult(context, inlineCompletionLists, defaultReplaceRange, model, languageConfigurationService);
-	tokenSource.dispose(true); // This disposes results that are not referenced.
+	tokenSource.dispose(true);
 	return result;
 }
 
@@ -159,7 +203,6 @@ function runWhenCancelled(token: CancellationToken, callback: () => void): IDisp
 	}
 }
 
-// TODO: check cancellation token!
 async function addRefAndCreateResult(
 	context: InlineCompletionContext,
 	inlineCompletionLists: AsyncIterable<(InlineCompletionList | undefined)>,
@@ -167,38 +210,53 @@ async function addRefAndCreateResult(
 	model: ITextModel,
 	languageConfigurationService: ILanguageConfigurationService | undefined
 ): Promise<InlineCompletionProviderResult> {
-	// for deduplication
 	const itemsByHash = new Map<string, InlineCompletionItem>();
-
 	let shouldStop = false;
 	const lists: InlineCompletionList[] = [];
+
 	for await (const completions of inlineCompletionLists) {
 		if (!completions) { continue; }
 		completions.addRef();
 		lists.push(completions);
-		for (const item of completions.inlineCompletions.items) {
-			if (!context.includeInlineEdits && item.isInlineEdit) {
-				continue;
-			}
-			if (!context.includeInlineCompletions && !item.isInlineEdit) {
-				continue;
-			}
-			const inlineCompletionItem = InlineCompletionItem.from(
-				item,
-				completions,
-				defaultReplaceRange,
-				model,
-				languageConfigurationService
-			);
 
-			itemsByHash.set(inlineCompletionItem.hash(), inlineCompletionItem);
+		const items = Symbol.asyncIterator in completions.inlineCompletions
+			? completions.inlineCompletions
+			: { [Symbol.asyncIterator]: async function* () { yield completions.inlineCompletions; } };
 
-			// Stop after first visible inline completion
-			if (!item.isInlineEdit && context.triggerKind === InlineCompletionTriggerKind.Automatic) {
-				const minifiedEdit = inlineCompletionItem.toSingleTextEdit().removeCommonPrefix(new TextModelText(model));
-				if (!minifiedEdit.isEmpty) {
-					shouldStop = true;
+		for await (const result of items) {
+			if (token.isCancellationRequested) {
+				break;
+			}
+
+			for (const item of result.items) {
+				if (!context.includeInlineEdits && item.isInlineEdit) {
+					continue;
 				}
+				if (!context.includeInlineCompletions && !item.isInlineEdit) {
+					continue;
+				}
+
+				const inlineCompletionItem = InlineCompletionItem.from(
+					item,
+					completions,
+					defaultReplaceRange,
+					model,
+					languageConfigurationService
+				);
+
+				itemsByHash.set(inlineCompletionItem.hash(), inlineCompletionItem);
+
+				if (!item.isInlineEdit && context.triggerKind === InlineCompletionTriggerKind.Automatic) {
+					const minifiedEdit = inlineCompletionItem.toSingleTextEdit().removeCommonPrefix(new TextModelText(model));
+					if (!minifiedEdit.isEmpty) {
+						shouldStop = true;
+						break;
+					}
+				}
+			}
+
+			if (shouldStop) {
+				break;
 			}
 		}
 

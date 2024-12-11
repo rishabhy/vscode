@@ -92,4 +92,37 @@ declare module 'vscode' {
 		 */
 		enableForwardStability?: boolean;
 	}
+
+	/**
+	 * Provides an async iterable interface for streaming results.
+	 */
+	export interface AsyncIterableProvider<T> extends AsyncIterable<T> {
+		[Symbol.asyncIterator](): AsyncIterator<T>;
+	}
+
+	/**
+	 * The streaming inline completion item provider interface extends the base provider
+	 * to support returning results incrementally through an async iterator.
+	 *
+	 * This allows providers to return partial results as they become available, which can
+	 * improve responsiveness for computationally intensive completion providers.
+	 */
+	export interface StreamingInlineCompletionItemProvider extends InlineCompletionItemProvider {
+		/**
+		 * Provides streaming inline completion items for the given position and document.
+		 * Results are returned incrementally through an async iterator.
+		 *
+		 * @param document The document inline completions are requested for.
+		 * @param position The position inline completions are requested for.
+		 * @param context A context object with additional information.
+		 * @param token A cancellation token.
+		 * @returns An async iterator that yields arrays of completion items or completion lists.
+		 */
+		provideStreamingInlineCompletionItems(
+			document: TextDocument,
+			position: Position,
+			context: InlineCompletionContext,
+			token: CancellationToken
+		): AsyncIterableProvider<InlineCompletionItem[] | InlineCompletionList>;
+	}
 }

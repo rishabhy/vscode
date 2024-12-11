@@ -1316,7 +1316,7 @@ class InlineCompletionAdapter extends InlineCompletionAdapterBase {
 	constructor(
 		private readonly _extension: IExtensionDescription,
 		private readonly _documents: ExtHostDocuments,
-		private readonly _provider: vscode.InlineCompletionItemProvider,
+		private readonly _provider: vscode.InlineCompletionItemProvider | vscode.StreamingInlineCompletionItemProvider,
 		private readonly _commands: CommandsConverter,
 	) {
 		super();
@@ -1337,6 +1337,26 @@ class InlineCompletionAdapter extends InlineCompletionAdapterBase {
 		const doc = this._documents.getDocument(resource);
 		const pos = typeConvert.Position.to(position);
 
+		// Check if provider supports streaming
+		if (this._isAdditionsProposedApiEnabled && 'provideStreamingInlineCompletionItems' in this._provider) {
+			const streamingResults = await this._provider.provideStreamingInlineCompletionItems(doc, pos, {
+				selectedCompletionInfo:
+					context.selectedSuggestionInfo
+						? {
+							range: typeConvert.Range.to(context.selectedSuggestionInfo.range),
+							text: context.selectedSuggestionInfo.text
+						}
+						: undefined,
+				triggerKind: this.languageTriggerKindToVSCodeTriggerKind[context.triggerKind]
+			}, token);
+
+			if (!streamingResults) {
+				return undefined;
+			}
+
+			return this._handleStreamingResults(streamingResults, token);
+		}
+
 		const result = await this._provider.provideInlineCompletionItems(doc, pos, {
 			selectedCompletionInfo:
 				context.selectedSuggestionInfo
@@ -1349,57 +1369,31 @@ class InlineCompletionAdapter extends InlineCompletionAdapterBase {
 		}, token);
 
 		if (!result) {
-			// undefined and null are valid results
 			return undefined;
 		}
 
 		if (token.isCancellationRequested) {
-			// cancelled -> return without further ado, esp no caching
-			// of results as they will leak
 			return undefined;
 		}
 
 		const normalizedResult = Array.isArray(result) ? result : result.items;
-		const commands = this._isAdditionsProposedApiEnabled ? Array.isArray(result) ? [] : result.commands || [] : [];
-		const enableForwardStability = this._isAdditionsProposedApiEnabled && !Array.isArray(result) ? result.enableForwardStability : undefined;
+		const commands = Array.isArray(result) ? [] : (result.commands || []);
 
-		let disposableStore: DisposableStore | undefined = undefined;
 		const pid = this._references.createReferenceId({
-			dispose() {
-				disposableStore?.dispose();
-			},
+			dispose: () => { },
 			items: normalizedResult
 		});
 
 		return {
 			pid,
-			items: normalizedResult.map<extHostProtocol.IdentifiableInlineCompletion>((item, idx) => {
-				let command: languages.Command | undefined = undefined;
-				if (item.command) {
-					if (!disposableStore) {
-						disposableStore = new DisposableStore();
-					}
-					command = this._commands.toInternal(item.command, disposableStore);
-				}
-
-				const insertText = item.insertText;
-				return ({
-					insertText: typeof insertText === 'string' ? insertText : { snippet: insertText.value },
-					filterText: item.filterText,
-					range: item.range ? typeConvert.Range.from(item.range) : undefined,
-					command,
-					idx: idx,
-					completeBracketPairs: this._isAdditionsProposedApiEnabled ? item.completeBracketPairs : false,
-				});
-			}),
-			commands: commands.map(c => {
-				if (!disposableStore) {
-					disposableStore = new DisposableStore();
-				}
-				return this._commands.toInternal(c, disposableStore);
-			}),
-			suppressSuggestions: false,
-			enableForwardStability,
+			items: normalizedResult.map((item, idx) => ({
+				insertText: typeof item.insertText === 'string' ? item.insertText : item.insertText.value,
+				range: item.range && typeConvert.Range.from(item.range),
+				command: item.command ? this._commands.toInternal(item.command) : undefined,
+				idx,
+				completeBracketPairs: this._isAdditionsProposedApiEnabled ? item.completeBracketPairs : false
+			})),
+			commands: commands.map(c => this._commands.toInternal(c))
 		};
 	}
 
@@ -1502,6 +1496,76 @@ class InlineCompletionAdapter extends InlineCompletionAdapterBase {
 			}
 		}
 	}
+
+	private async _handleStreamingResults(streamingResults: vscode.AsyncIterableProvider<vscode.InlineCompletionItem[] | vscode.InlineCompletionList>, token: CancellationToken): Promise<extHostProtocol.IdentifiableInlineCompletions | undefined> {
+		const items: vscode.InlineCompletionItem[] = [];
+		let disposableStore: DisposableStore | undefined = undefined;
+		let commands: vscode.Command[] = [];
+		let enableForwardStability: boolean | undefined;
+
+		try {
+			for await (const result of streamingResults) {
+				if (token.isCancellationRequested) {
+					break;
+				}
+
+				const normalizedResult = Array.isArray(result) ? result : result.items;
+				items.push(...normalizedResult);
+
+				if (!Array.isArray(result)) {
+					commands = result.commands || [];
+					enableForwardStability = result.enableForwardStability;
+				}
+
+				// Create a reference for the current state
+				const pid = this._references.createReferenceId({
+					dispose() {
+						disposableStore?.dispose();
+					},
+					items
+				});
+
+				// Return intermediate results
+				const completions: extHostProtocol.IdentifiableInlineCompletions = {
+					pid,
+					items: items.map<extHostProtocol.IdentifiableInlineCompletion>((item, idx) => {
+						let command: languages.Command | undefined = undefined;
+						if (item.command) {
+							if (!disposableStore) {
+								disposableStore = new DisposableStore();
+							}
+							command = this._commands.toInternal(item.command, disposableStore);
+						}
+
+						const insertText = item.insertText;
+						return ({
+							insertText: typeof insertText === 'string' ? insertText : { snippet: insertText.value },
+							filterText: item.filterText,
+							range: item.range ? typeConvert.Range.from(item.range) : undefined,
+							command,
+							idx,
+							completeBracketPairs: this._isAdditionsProposedApiEnabled ? item.completeBracketPairs : false,
+						});
+					}),
+					commands: commands.map(c => {
+						if (!disposableStore) {
+							disposableStore = new DisposableStore();
+						}
+						return this._commands.toInternal(c, disposableStore);
+					}),
+					suppressSuggestions: false,
+					enableForwardStability,
+				};
+
+				return completions;
+			}
+		} catch (error) {
+			console.error('Error in streaming inline completions:', error);
+			return undefined;
+		}
+
+		return undefined;
+	}
 }
 
 class InlineEditAdapter {
@@ -1514,6 +1578,14 @@ class InlineEditAdapter {
 		[languages.InlineEditTriggerKind.Automatic]: InlineEditTriggerKind.Automatic,
 		[languages.InlineEditTriggerKind.Invoke]: InlineEditTriggerKind.Invoke,
 	};
+
+	constructor(
+		_extension: IExtensionDescription,
+		private readonly _documents: ExtHostDocuments,
+		private readonly _provider: vscode.InlineEditProvider,
+		private readonly _commands: CommandsConverter,
+	) {
+	}
 
 	async provideInlineEdits(uri: URI, context: languages.IInlineEditContext, token: CancellationToken): Promise<extHostProtocol.IdentifiableInlineEdit | undefined> {
 		const doc = this._documents.getDocument(uri);
@@ -1581,14 +1653,6 @@ class InlineEditAdapter {
 	disposeEdit(pid: number) {
 		const data = this._references.disposeReferenceId(pid);
 		data?.dispose();
-	}
-
-	constructor(
-		_extension: IExtensionDescription,
-		private readonly _documents: ExtHostDocuments,
-		private readonly _provider: vscode.InlineEditProvider,
-		private readonly _commands: CommandsConverter,
-	) {
 	}
 }
 
